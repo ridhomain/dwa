@@ -1,11 +1,13 @@
+// src/types/fastify.d.ts
 import 'fastify';
 import Redis from 'ioredis';
-import { JetStreamClient, JetStreamManager, NatsConnection } from 'nats';
+import { JetStreamClient, JetStreamManager, NatsConnection, KV } from 'nats';
 import { Metrics } from '../../types/metrics';
 import { TaskApiService } from '../services/api/taskApiService';
 import { DbApiService } from '../services/api/dbApiService';
 import { OnboardingService } from '../services/onboardingService';
 import { ConfigLoaderService, LoadedConfigs } from '../services/configLoader';
+import { MediaDownloadService } from '../services/mediaDownloadService';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -13,6 +15,7 @@ declare module 'fastify' {
     js: JetStreamClient;
     jsm: JetStreamManager;
     nats: NatsConnection;
+    broadcastStateKV: KV;
     publishEvent: any;
     metrics: Metrics;
     taskApiService: TaskApiService;

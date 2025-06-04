@@ -11,6 +11,7 @@ import {
 import { getSock } from '../utils/sock';
 import { sendMessage } from '../services/sendMessage';
 import { applyVariables } from '../utils/index';
+import { updateBroadcastProgress } from '../utils/broadcast';
 
 const sc = StringCodec();
 
@@ -121,17 +122,29 @@ export async function createAgentDurableConsumer(fastify: FastifyInstance) {
 
           // Extract headers if present
           const headers = m.headers;
-          const batchId = headers?.get('Batch-Id');
-          const agentId = headers?.get('Agent-Id');
-          const companyId = headers?.get('Company');
+          const batchId = headers?.get('Batch-Id') || data.batchId;
+          const agentId = headers?.get('Agent-Id') || data.agentId;
+          // const companyId = headers?.get('Company') || data.companyId;
 
-          fastify.log.info(`[AgentDurableConsumer] Received ${messageType} message: %o`, {
+          // Check deduplication using Redis (keep Redis for dedup as it's faster)
+          const dedupKey = `dedup:${fastify.config.AGENT_ID}:${batchId || 'mailcast'}:${data.phoneNumber}`;
+          const alreadyProcessed = await fastify.redis.get(dedupKey);
+
+          if (alreadyProcessed) {
+            fastify.log.info(
+              `[AgentDurableConsumer] Already processed ${data.phoneNumber} for ${messageType} ${batchId || ''}, skipping`
+            );
+            m.ack();
+            continue;
+          }
+
+          fastify.log.info(`[AgentDurableConsumer] Processing ${messageType} message: %o`, {
             subject: m.subject,
             seq: m.seq,
             redeliveryCount: m.info.redeliveryCount,
             batchId,
             agentId,
-            dataKeys: Object.keys(data),
+            phoneNumber: data.phoneNumber,
           });
 
           // Validate agent ID matches (either from header or data)
@@ -152,22 +165,34 @@ export async function createAgentDurableConsumer(fastify: FastifyInstance) {
             continue;
           }
 
-          // Check if broadcast is cancelled (for broadcast messages)
+          // Check broadcast status from NATS KV (instead of Redis)
           if (messageType === 'broadcast' && batchId) {
-            const broadcastKey = `broadcast:active:${fastify.config.AGENT_ID}:${batchId}`;
-            const broadcastState = await fastify.redis.get(broadcastKey);
-            
-            if (broadcastState) {
-              const state = JSON.parse(broadcastState);
+            const stateKey = `${fastify.config.AGENT_ID}_${batchId}`;
+            const kvEntry = await fastify.broadcastStateKV.get(stateKey);
+
+            if (kvEntry) {
+              const state = JSON.parse(sc.decode(kvEntry.value));
+
               if (state.status === 'CANCELLED') {
                 fastify.log.info(`[Broadcast] Skipping cancelled broadcast ${batchId}`);
                 m.ack();
                 continue;
               }
+
+              if (state.status === 'PAUSED') {
+                fastify.log.info(`[Broadcast] Broadcast ${batchId} is paused, will retry later`);
+                // Don't ack - message will be redelivered after ack_wait (30s)
+                continue;
+              }
+            } else {
+              // No state found, might be old message or state expired
+              fastify.log.warn(
+                `[Broadcast] No state found for batch ${batchId}, processing anyway`
+              );
             }
           }
 
-          // Process based on message type
+          // Process message
           let success = false;
           let errMessage: string | undefined;
           let sentMsg: any;
@@ -185,9 +210,51 @@ export async function createAgentDurableConsumer(fastify: FastifyInstance) {
           }
 
           if (success) {
+            // Mark as processed in Redis for deduplication
+            const dedupResult = await fastify.redis.set(
+              dedupKey,
+              JSON.stringify({
+                processedAt: new Date().toISOString(),
+                messageId: sentMsg?.key?.id,
+                seq: m.seq,
+                messageType,
+              }),
+              'EX',
+              604800, // 7 days TTL
+              'NX' // Only set if not exists
+            );
+
+            if (dedupResult !== 'OK') {
+              fastify.log.warn(
+                `[AgentDurableConsumer] Concurrent processing detected for ${dedupKey}`
+              );
+            }
+
             // Acknowledge the message
             m.ack();
+
             fastify.log.info(`[AgentDurableConsumer] ${messageType} processed successfully`);
+
+            // Update broadcast progress if it's a broadcast message
+            if (messageType === 'broadcast' && batchId) {
+              try {
+                await updateBroadcastProgress(
+                  fastify.broadcastStateKV,
+                  batchId,
+                  fastify.config.AGENT_ID,
+                  {
+                    status: 'COMPLETED',
+                    phoneNumber: data.phoneNumber,
+                  }
+                );
+              } catch (err) {
+                fastify.log.error(
+                  { err, batchId },
+                  '[AgentDurableConsumer] Failed to update broadcast progress'
+                );
+                // Don't fail the message processing for progress update failure
+              }
+            }
 
             // Update task status if taskId is provided
             if (data.taskId && fastify.taskApiService) {
@@ -225,6 +292,26 @@ export async function createAgentDurableConsumer(fastify: FastifyInstance) {
               '[AgentDurableConsumer] Failed to process message'
             );
 
+            // Update broadcast progress for failures (only on final failure)
+            if (messageType === 'broadcast' && batchId && !shouldRetry) {
+              try {
+                await updateBroadcastProgress(
+                  fastify.broadcastStateKV,
+                  batchId,
+                  fastify.config.AGENT_ID,
+                  {
+                    status: 'ERROR',
+                    phoneNumber: data.phoneNumber,
+                  }
+                );
+              } catch (err) {
+                fastify.log.error(
+                  { err, batchId },
+                  '[AgentDurableConsumer] Failed to update broadcast progress for error'
+                );
+              }
+            }
+
             // Update task status if taskId is provided
             if (data.taskId && fastify.taskApiService) {
               try {
@@ -247,6 +334,21 @@ export async function createAgentDurableConsumer(fastify: FastifyInstance) {
 
             if (!shouldRetry) {
               // Max retries reached, acknowledge to prevent infinite loop
+              // Also mark as failed in dedup to prevent future attempts
+              await fastify.redis.set(
+                dedupKey,
+                JSON.stringify({
+                  processedAt: new Date().toISOString(),
+                  failed: true,
+                  error: errMessage,
+                  seq: m.seq,
+                  messageType,
+                  retries: m.info.redeliveryCount,
+                }),
+                'EX',
+                604800 // 7 days TTL
+              );
+
               m.ack();
               fastify.log.error(
                 `[AgentDurableConsumer] Max retries reached for ${messageType} message`
@@ -328,7 +430,7 @@ async function processMailcastMessage(
       processedMessage = applyVariables(message, variables);
     }
 
-    fastify.log.info(`[Mailcast] Sending message to ${phoneNumber}, message: %o`, processedMessage);
+    fastify.log.info(`[Mailcast] Sending message to ${phoneNumber}`);
 
     const { quoted } = options ?? {};
 
@@ -354,7 +456,7 @@ async function processBroadcastMessage(
   data: BroadcastPayload
 ): Promise<{ success: boolean; errMessage?: string; sentMsg?: any }> {
   try {
-    const { phoneNumber, message, options, variables, contact, batchId, taskAgent } = data;
+    const { phoneNumber, message, options, variables, contact, batchId } = data;
 
     if (!phoneNumber || !message) {
       throw new Error('Missing required fields: phoneNumber or message');
@@ -371,7 +473,7 @@ async function processBroadcastMessage(
         ...contact,
         ...variables,
       };
-      processedMessage = applyVariables(message, allVariables, contact);
+      processedMessage = applyVariables(message, allVariables);
     }
 
     fastify.log.info(`[Broadcast] Sending to ${phoneNumber} (batch: ${batchId})`);
@@ -382,22 +484,8 @@ async function processBroadcastMessage(
 
     if (result.success) {
       fastify.log.info(`[Broadcast] Message sent successfully to ${phoneNumber}`);
-      
-      // Update batch progress in Redis if needed
-      if (batchId) {
-        const progressKey = `broadcast:progress:${fastify.config.AGENT_ID}:${batchId}`;
-        await fastify.redis.hincrby(progressKey, 'sent', 1);
-        await fastify.redis.expire(progressKey, 86400); // 24 hours
-      }
     } else {
       fastify.log.error(`[Broadcast] Failed to send to ${phoneNumber}: ${result.errMessage}`);
-      
-      // Update failure count
-      if (batchId) {
-        const progressKey = `broadcast:progress:${fastify.config.AGENT_ID}:${batchId}`;
-        await fastify.redis.hincrby(progressKey, 'failed', 1);
-        await fastify.redis.expire(progressKey, 86400); // 24 hours
-      }
     }
 
     return result;

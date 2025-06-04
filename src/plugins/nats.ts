@@ -1,5 +1,6 @@
+// src/plugins/nats.ts
 import fp from 'fastify-plugin';
-import { connect, StringCodec, JetStreamClient, JetStreamManager } from 'nats';
+import { connect, StringCodec, JetStreamClient, JetStreamManager, KV } from 'nats';
 
 export default fp(async (fastify) => {
   const servers = fastify.config.NATS_SERVERS.split(',');
@@ -57,6 +58,20 @@ export default fp(async (fastify) => {
   const js: JetStreamClient = nc.jetstream();
   const jsm: JetStreamManager = await nc.jetstreamManager();
 
+  // Initialize KV stores
+  let broadcastStateKV: KV;
+  try {
+    broadcastStateKV = await js.views.kv('broadcast_state');
+    fastify.log.info('[NATS] Connected to existing broadcast_state KV');
+  } catch (err: any) {
+    // Create KV bucket if it doesn't exist
+    broadcastStateKV = await js.views.kv('broadcast_state', {
+      history: 5,
+      ttl: 7 * 24 * 60 * 60 * 1000, // 7 days TTL in milliseconds
+    });
+    fastify.log.warn(`[NATS] ${err.message}. Create broadcast_state KV`);
+  }
+
   // utils functions
   const publishEvent = async (subject: string, data: any) => {
     try {
@@ -74,6 +89,7 @@ export default fp(async (fastify) => {
   fastify.decorate('nats', nc);
   fastify.decorate('js', js);
   fastify.decorate('jsm', jsm);
+  fastify.decorate('broadcastStateKV', broadcastStateKV);
   fastify.decorate('publishEvent', publishEvent);
 
   fastify.addHook('onClose', async () => {

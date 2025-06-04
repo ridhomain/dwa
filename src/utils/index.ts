@@ -104,11 +104,6 @@ export const extractMessageText = (message: any): string | null => {
   return null;
 };
 
-// src/utils/template.utils.ts
-/**
- * Message template utilities for variable substitution
- */
-
 /**
  * Apply variables to a message template
  * Handles nested objects and arrays
@@ -138,11 +133,11 @@ function deepApplyVariables(obj: any, variables: Record<string, any>): any {
   if (typeof obj === 'string') {
     return replaceVariables(obj, variables);
   }
-  
+
   if (Array.isArray(obj)) {
-    return obj.map(item => deepApplyVariables(item, variables));
+    return obj.map((item) => deepApplyVariables(item, variables));
   }
-  
+
   if (obj && typeof obj === 'object') {
     const result: any = {};
     for (const [key, value] of Object.entries(obj)) {
@@ -150,9 +145,9 @@ function deepApplyVariables(obj: any, variables: Record<string, any>): any {
     }
     return result;
   }
-  
+
   return obj;
-};
+}
 
 /**
  * Replace variables in a string
@@ -161,19 +156,19 @@ function deepApplyVariables(obj: any, variables: Record<string, any>): any {
 function replaceVariables(text: string, variables: Record<string, any>): string {
   return text.replace(/\{\{(\w+)(?:\|([^}]+))?\}\}/g, (match, varName, defaultValue) => {
     const value = getNestedValue(variables, varName);
-    
+
     if (value !== undefined && value !== null) {
       return String(value);
     }
-    
+
     if (defaultValue !== undefined) {
       return defaultValue;
     }
-    
+
     // Return original if no value found
     return match;
   });
-};
+}
 
 /**
  * Get nested object value using dot notation
@@ -182,7 +177,7 @@ function replaceVariables(text: string, variables: Record<string, any>): string 
 function getNestedValue(obj: Record<string, any>, path: string): any {
   const parts = path.split('.');
   let current = obj;
-  
+
   for (const part of parts) {
     if (current && typeof current === 'object' && part in current) {
       current = current[part];
@@ -190,9 +185,9 @@ function getNestedValue(obj: Record<string, any>, path: string): any {
       return undefined;
     }
   }
-  
+
   return current;
-};
+}
 
 /**
  * Extract variable names from a message template
@@ -201,20 +196,16 @@ function getNestedValue(obj: Record<string, any>, path: string): any {
 export function extractVariables(content: any): string[] {
   const variables = new Set<string>();
   const pattern = /\{\{(\w+)\}\}/g;
-  
+
   // Check all text fields
-  const textFields = [
-    content.text,
-    content.caption,
-    content.fileName,
-  ].filter(Boolean);
-  
+  const textFields = [content.text, content.caption, content.fileName].filter(Boolean);
+
   for (const field of textFields) {
     const matches = field.matchAll(pattern);
     for (const match of matches) {
       variables.add(match[1]);
     }
   }
-  
+
   return Array.from(variables);
 }
