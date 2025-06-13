@@ -32,7 +32,7 @@ export const registerEvents = (fastify: FastifyInstance, saveCreds: any) => {
 
       await handleChatsSet(fastify, chats);
       await handleContactsSet(fastify, contacts);
-      await handleMessagesSet(fastify, messages);
+      await handleMessagesSet(fastify, messages, progress);
     }
 
     // Contacts Events

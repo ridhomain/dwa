@@ -22,35 +22,46 @@ export class DbApiService {
       };
 
       if (this.token) {
-        headers['token'] = `${this.token}`;
+        headers['token'] = this.token;
       }
 
-      // GraphQL query to get config
-      const query = `
-        query getConfig($key: String!) {
-          configs(filter: { key: $key }) {
+      // Use the exact GraphQL query structure that works
+      const payloadGQL = {
+        query: `query config($key: String) { 
+          config(key: $key) {  
             key
             value
           }
-        }
-      `;
-
-      const variables = { key };
+        }`,
+        variables: {
+          key,
+        },
+      };
 
       const response = await request(`${this.baseUrl}/graphql`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ query, variables }),
+        body: JSON.stringify(payloadGQL),
       });
 
       if (response.statusCode >= 200 && response.statusCode < 300) {
         const data = (await response.body.json()) as any;
-        return data.data?.configs || [];
+
+        if (data.errors) {
+          throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
+        }
+
+        // Handle the single config response format
+        if (data.data?.config) {
+          return [data.data.config];
+        }
+
+        return [];
       }
 
       throw new Error(`Config API returned ${response.statusCode}`);
-    } catch (error) {
-      throw new Error(`Failed to get config ${key}: ${error}`);
+    } catch (error: any) {
+      throw new Error(`Failed to get config ${key}: ${error.message}`);
     }
   }
 
@@ -59,40 +70,19 @@ export class DbApiService {
    */
   async getConfigs(keys: string[]): Promise<ConfigResponse[]> {
     try {
-      const headers: Record<string, string> = {
-        'Content-Type': 'application/json',
-      };
+      // Since the API uses singular 'config', we need to make multiple requests
+      const results = await Promise.allSettled(keys.map((key) => this.getConfig(key)));
 
-      if (this.token) {
-        headers['token'] = `${this.token}`;
-      }
-
-      // GraphQL query to get multiple configs
-      const query = `
-        query getConfigs($keys: [String!]!) {
-          configs(filter: { key: { in: $keys } }) {
-            key
-            value
-          }
+      const configs: ConfigResponse[] = [];
+      for (const result of results) {
+        if (result.status === 'fulfilled') {
+          configs.push(...result.value);
         }
-      `;
-
-      const variables = { keys };
-
-      const response = await request(`${this.baseUrl}/graphql`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ query, variables }),
-      });
-
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        const data = (await response.body.json()) as any;
-        return data.data?.configs || [];
       }
 
-      throw new Error(`Config API returned ${response.statusCode}`);
-    } catch (error) {
-      throw new Error(`Failed to get configs: ${error}`);
+      return configs;
+    } catch (error: any) {
+      throw new Error(`Failed to get configs: ${error.message}`);
     }
   }
 }

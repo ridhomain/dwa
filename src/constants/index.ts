@@ -17,3 +17,5 @@ export const ALLOWED_MSG_TYPES = [
   'editedMessage',
   'protocolMessage',
 ];
+
+export const REDIS_TTL_MS = 2000;

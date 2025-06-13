@@ -21,10 +21,12 @@ export class MediaDownloadService {
   async downloadMedia(
     media: any,
     type: any,
-    messageId: string,
+    messageId: string | undefined | null,
     mimeType: string
   ): Promise<MediaDownloadResult> {
     try {
+      if (!messageId) return { success: false, error: 'no message id' };
+
       this.logger.info(`[MediaDownload] Starting download for ${messageId}, type: ${type}`);
 
       // Set file size limit (10MB)

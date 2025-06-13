@@ -53,7 +53,7 @@ export const handleConnectionUpdate = async (
     connection === 'close' &&
     (lastDisconnect?.error as Boom)?.output?.statusCode === DisconnectReason.loggedOut
   ) {
-    await emitStatus('CLOSE');
+    await emitStatus('LOGOUT');
     // prometheus metrics
 
     // REMOVE AUTH KEYS

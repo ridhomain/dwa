@@ -24,7 +24,7 @@ export interface MessageUpsertPayload {
   status: string;
   created_at: string;
   push_name?: string | null;
-  onboarding_metadata?: OnboardingMetadata | null;
+  campaign?: OnboardingMetadata | null;
 }
 
 // export interface ChatUpsertPayload {

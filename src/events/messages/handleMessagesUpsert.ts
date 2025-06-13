@@ -3,7 +3,7 @@ import {
   WAMessage,
   MessageUpsertType,
   jidNormalizedUser,
-  // isJidGroup,
+  isJidGroup,
 } from 'baileys';
 import { FastifyInstance } from 'fastify';
 // import { ALLOWED_MSG_TYPES } from '../../constants';
@@ -14,9 +14,9 @@ import {
   getPhoneFromJid,
   extractMessageText,
 } from '../../utils';
-// import { getSock } from '../../utils/sock';
+import { getSock } from '../../utils/sock';
 import { MessageUpsertPayload } from '../../types/messages';
-// import { sendMessage } from '../../services/sendMessage';
+import { sendMessage } from '../../services/sendMessage';
 
 export const handleMessagesUpsert = async (
   fastify: FastifyInstance,
@@ -28,7 +28,6 @@ export const handleMessagesUpsert = async (
 
   // Initialize media download service
   const mediaService = fastify.mediaService;
-  // const onboardingService = fastify.onboardingService;
 
   for (const m of messages) {
     // fastify.log.info('[messages.upsert] message: %o', m);
@@ -140,53 +139,49 @@ export const handleMessagesUpsert = async (
 
     // Onboarding Process
     // Initialize onboarding metadata
-    // let onboardingMetadata:
-    //   | {
-    //       tags?: string;
-    //       origin?: string;
-    //       assigned_to?: string;
-    //     }
-    //   | undefined;
+    let campaign:
+      | {
+          is_campaign: boolean;
+          tags?: string;
+          origin?: string;
+          assigned_to?: string;
+        }
+      | undefined;
 
     // // Check onboarding only for incoming messages, non-group, and notify/append type
-    // if (!fromMe && !isJidGroup(jid) && messageText && (type === 'notify' || type === 'append')) {
-    //   fastify.log.info('[messages.upsert] Checking onboarding for message: %s', messageText);
+    if (!fromMe && !isJidGroup(jid) && messageText && (type === 'notify' || type === 'append')) {
+      fastify.log.info('[messages.upsert] Checking onboarding for message: %s', messageText);
+      const onboardingService = fastify.onboardingService;
+      const { campaign, reply } = await onboardingService.checkOnboarding(messageText);
 
-    //   const onboardingResult = await onboardingService.checkOnboarding(messageText);
+      if (campaign.is_campaign) {
+        fastify.log.info('[messages.upsert] Message is an onboarding message');
 
-    //   if (onboardingResult.isOnboarding && onboardingResult.metadata) {
-    //     fastify.log.info('[messages.upsert] Message is an onboarding message');
+        // Send auto-reply if configured
+        if (reply) {
+          try {
+            const sock = getSock();
 
-    //     onboardingMetadata = onboardingResult.metadata;
+            const result = await sendMessage(sock, reply, remoteJid, null);
 
-    //     // Send auto-reply if configured
-    //     if (onboardingResult.metadata.reply) {
-    //       try {
-    //         const sock = getSock();
-    //         const autoReplyMessage = {
-    //           text: onboardingResult.metadata.reply,
-    //         };
-
-    //         const result = await sendMessage(sock, autoReplyMessage, remoteJid, null);
-
-    //         if (result.success) {
-    //           fastify.log.info('[messages.upsert] Auto-reply sent successfully');
-    //         } else {
-    //           fastify.log.error(
-    //             '[messages.upsert] Failed to send auto-reply: %s',
-    //             result.errMessage
-    //           );
-    //         }
-    //       } catch (err: any) {
-    //         fastify.log.error('[messages.upsert] Error sending auto-reply: %o', err.message);
-    //       }
-    //     }
-    //   } else {
-    //     // For non-onboarding messages, we'll let WEP determine if it's a first message
-    //     // and apply default metadata
-    //     fastify.log.info('[messages.upsert] Message is not an onboarding message');
-    //   }
-    // }
+            if (result.success) {
+              fastify.log.info('[messages.upsert] Auto-reply sent successfully');
+            } else {
+              fastify.log.error(
+                '[messages.upsert] Failed to send auto-reply: %s',
+                result.errMessage
+              );
+            }
+          } catch (err: any) {
+            fastify.log.error('[messages.upsert] Error sending auto-reply: %o', err.message);
+          }
+        }
+      } else {
+        // For non-onboarding messages, we'll let WEP determine if it's a first message
+        // and apply default metadata
+        fastify.log.info('[messages.upsert] Message is not an onboarding message');
+      }
+    }
 
     // publish to nats
     try {
@@ -207,7 +202,7 @@ export const handleMessagesUpsert = async (
         message_timestamp: Number(messageTimestamp),
         status: status ? status.toString() : '0',
         created_at: new Date().toISOString(),
-        // onboarding_metadata: onboardingMetadata || null,
+        campaign,
       };
 
       await fastify.publishEvent(subject, payload);

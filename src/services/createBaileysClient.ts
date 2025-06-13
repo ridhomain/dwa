@@ -28,7 +28,6 @@ export const createBaileysClient = async (fastify: FastifyInstance): Promise<WAS
   const sock = makeWASocket({
     version,
     logger: fastify.log.child({ scope: 'baileys' }),
-    printQRInTerminal: true,
     auth: {
       creds: state.creds, // optional
       /** caching makes the store faster to send/recv messages */
@@ -55,7 +54,7 @@ export const createBaileysClient = async (fastify: FastifyInstance): Promise<WAS
 
       return JSON.parse(msg);
     },
-    browser: ['Proto v1.0.0', 'Desktop', version.join('.')],
+    browser: ['Daisi v5.0.0', 'Desktop', version.join('.')],
     syncFullHistory: true,
   });
 

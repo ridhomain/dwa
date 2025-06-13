@@ -1,7 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import { isJidUser } from 'baileys';
 
-import { chunkArray } from '../../utils';
+import { chunkArray, generateDaisiChatId, getPhoneFromJid } from '../../utils';
 
 const BATCH_SIZE = 100;
 
@@ -16,10 +16,11 @@ export const handleContactsSet = async (fastify: FastifyInstance, contacts: any[
     // fastify.log.info('[contacts.set] contact: %o', contact);
 
     const { id, notify, verifiedName } = contact;
-    const phone_number = id.replace(/@.*$/, '');
+    const phone_number = getPhoneFromJid(id);
 
     const payload = {
       company_id: fastify.config.COMPANY_ID,
+      chat_id: generateDaisiChatId(fastify.config.AGENT_ID, id),
       agent_id: fastify.config.AGENT_ID,
       phone_number,
       push_name: notify || verifiedName || phone_number,

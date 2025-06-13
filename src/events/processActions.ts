@@ -2,9 +2,11 @@ import { FastifyInstance } from 'fastify';
 import { getSock } from '../utils/sock';
 import { sendMessage } from '../services/sendMessage';
 import { ActionName, ActionResponseMap } from '../types/actions';
-import { StringCodec } from 'nats';
+// import { StringCodec } from 'nats';
+import { REDIS_TTL_MS } from '../constants';
+import { generateDaisiChatId } from '../utils';
 
-const sc = StringCodec();
+// const sc = StringCodec();
 
 function extractMediaUrlFromMessage(message: any): string | null {
   if (!message) return null;
@@ -125,6 +127,31 @@ export const processActions = async <T extends ActionName>(
       }
 
       await sock.readMessages([{ remoteJid, id }]);
+
+      // debounce set unread to 0
+      const debounceKey = `debounce:chat-unread:${fastify.config.AGENT_ID}:${remoteJid}`;
+
+      try {
+        const result = await fastify.redis.set(debounceKey, '1', 'PX', REDIS_TTL_MS, 'NX');
+        if (result === 'OK') {
+          const chatId = generateDaisiChatId(fastify.config.AGENT_ID, remoteJid);
+
+          const chatPayload = {
+            chat_id: chatId,
+            company_id: fastify.config.COMPANY_ID,
+            agent_id: fastify.config.AGENT_ID,
+            unread_count: 0,
+          };
+
+          await fastify.publishEvent(`v1.chats.update.${fastify.config.COMPANY_ID}`, chatPayload);
+
+          fastify.log.info(
+            `[MARK_AS_READ] Synced unread_count=0 via Redis debounce for chat: ${remoteJid}`
+          );
+        }
+      } catch (err: any) {
+        fastify.log.error('[MARK_AS_READ] chat update debounce error: %o', err.message);
+      }
       return {
         success: true,
         data: { msgId: id },
@@ -194,164 +221,6 @@ export const processActions = async <T extends ActionName>(
           error: downloadResult.error || 'Media download failed',
         } as ActionResponseMap[T];
       }
-    }
-
-    // Broadcast control signals - use NATS KV instead of Redis
-    if (action === 'START_BROADCAST') {
-      const { batchId, companyId } = payload;
-
-      fastify.log.info(`[BROADCAST] Received START signal for batch ${batchId}`);
-
-      // Update state in NATS KV
-      const stateKey = `${fastify.config.AGENT_ID}_${batchId}`;
-      const currentEntry = await fastify.broadcastStateKV.get(stateKey);
-
-      if (currentEntry) {
-        const state = JSON.parse(sc.decode(currentEntry.value));
-        state.status = 'PROCESSING';
-        state.startedAt = new Date().toISOString();
-
-        // Update with version check
-        await fastify.broadcastStateKV.update(
-          stateKey,
-          sc.encode(JSON.stringify(state)),
-          currentEntry.revision
-        );
-      } else {
-        // Create new state if doesn't exist
-        await fastify.broadcastStateKV.create(
-          stateKey,
-          sc.encode(
-            JSON.stringify({
-              status: 'PROCESSING',
-              batchId,
-              agentId: fastify.config.AGENT_ID,
-              companyId,
-              startedAt: new Date().toISOString(),
-            })
-          )
-        );
-      }
-
-      return {
-        success: true,
-        data: {
-          batchId,
-          status: 'STARTED',
-          timestamp: new Date().toISOString(),
-        },
-      } as ActionResponseMap[T];
-    }
-
-    if (action === 'PAUSE_BROADCAST') {
-      const { batchId } = payload;
-
-      fastify.log.info(`[BROADCAST] Received PAUSE signal for batch ${batchId}`);
-
-      const stateKey = `${fastify.config.AGENT_ID}_${batchId}`;
-      const currentEntry = await fastify.broadcastStateKV.get(stateKey);
-
-      if (currentEntry) {
-        const state = JSON.parse(sc.decode(currentEntry.value));
-        state.status = 'PAUSED';
-        state.pausedAt = new Date().toISOString();
-
-        await fastify.broadcastStateKV.update(
-          stateKey,
-          sc.encode(JSON.stringify(state)),
-          currentEntry.revision
-        );
-
-        fastify.log.info(`[BROADCAST] Broadcast ${batchId} paused successfully`);
-      } else {
-        fastify.log.warn(`[BROADCAST] Could not find state for batch ${batchId} to pause`);
-      }
-
-      return {
-        success: true,
-        data: {
-          batchId,
-          status: 'PAUSED',
-          timestamp: new Date().toISOString(),
-        },
-      } as ActionResponseMap[T];
-    }
-
-    if (action === 'RESUME_BROADCAST') {
-      const { batchId } = payload;
-
-      fastify.log.info(`[BROADCAST] Received RESUME signal for batch ${batchId}`);
-
-      const stateKey = `${fastify.config.AGENT_ID}_${batchId}`;
-      const currentEntry = await fastify.broadcastStateKV.get(stateKey);
-
-      if (currentEntry) {
-        const state = JSON.parse(sc.decode(currentEntry.value));
-        state.status = 'PROCESSING';
-        state.resumedAt = new Date().toISOString();
-
-        await fastify.broadcastStateKV.update(
-          stateKey,
-          sc.encode(JSON.stringify(state)),
-          currentEntry.revision
-        );
-
-        fastify.log.info(`[BROADCAST] Broadcast ${batchId} resumed successfully`);
-      } else {
-        fastify.log.warn(`[BROADCAST] Could not find state for batch ${batchId} to resume`);
-      }
-
-      return {
-        success: true,
-        data: {
-          batchId,
-          status: 'RESUMED',
-          timestamp: new Date().toISOString(),
-        },
-      } as ActionResponseMap[T];
-    }
-
-    if (action === 'CANCEL_BROADCAST') {
-      const { batchId } = payload;
-
-      fastify.log.info(`[BROADCAST] Received CANCEL signal for batch ${batchId}`);
-
-      const stateKey = `${fastify.config.AGENT_ID}_${batchId}`;
-      const currentEntry = await fastify.broadcastStateKV.get(stateKey);
-
-      if (currentEntry) {
-        const state = JSON.parse(sc.decode(currentEntry.value));
-        state.status = 'CANCELLED';
-        state.cancelledAt = new Date().toISOString();
-
-        await fastify.broadcastStateKV.update(
-          stateKey,
-          sc.encode(JSON.stringify(state)),
-          currentEntry.revision
-        );
-      } else {
-        // Create cancelled state even if didn't exist
-        await fastify.broadcastStateKV.create(
-          stateKey,
-          sc.encode(
-            JSON.stringify({
-              status: 'CANCELLED',
-              batchId,
-              agentId: fastify.config.AGENT_ID,
-              cancelledAt: new Date().toISOString(),
-            })
-          )
-        );
-      }
-
-      return {
-        success: true,
-        data: {
-          batchId,
-          status: 'CANCELLED',
-          timestamp: new Date().toISOString(),
-        },
-      } as ActionResponseMap[T];
     }
 
     return { success: false, error: 'Unknown action' } as ActionResponseMap[T];

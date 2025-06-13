@@ -38,8 +38,8 @@ export class ConfigLoaderService {
    */
   private async loadConfig(key: string, defaultValue: any): Promise<any> {
     try {
-      // Use your existing dbApiService to query configs
-      const response = await this.queryConfigs(key);
+      // Use the existing dbApiService instead of direct undici import
+      const response = await this.fastify.dbApiService.getConfig(key);
 
       if (response && response.length > 0) {
         const configValue = response[0].value;
@@ -53,54 +53,9 @@ export class ConfigLoaderService {
         this.fastify.log.warn(`Config not found for ${key}, using default: %o`, defaultValue);
       }
       return defaultValue;
-    } catch (error) {
-      this.fastify.log.error(`Error loading config ${key}: ${error}`);
+    } catch (error: any) {
+      this.fastify.log.error(`Error loading config ${key}: ${error.message}`);
       return defaultValue;
-    }
-  }
-
-  /**
-   * Query configs from DB API - implement based on your API structure
-   */
-  private async queryConfigs(key: string): Promise<any[]> {
-    // This is a placeholder - you'll need to implement this based on your DB API structure
-    // Example implementation:
-
-    try {
-      // If your DB API has a GraphQL endpoint like the original
-      const query = `
-        query getConfig($key: String!) {
-          configs(filter: { key: $key }) {
-            key
-            value
-          }
-        }
-      `;
-
-      const variables = { key };
-
-      // Use undici request directly since dbApiService doesn't have methods yet
-      const { request } = await import('undici');
-
-      const response = await request(`${this.fastify.config.DB_API_URL}/graphql`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          token: `${this.fastify.config.TOKEN}`,
-        },
-        body: JSON.stringify({ query, variables }),
-      });
-
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        const data = (await response.body.json()) as any;
-        return data.data?.configs || [];
-      }
-
-      this.fastify.log.warn(`Config API returned ${response.statusCode} for key: ${key}`);
-      return [];
-    } catch (error) {
-      this.fastify.log.error(`Failed to query config for ${key}:`, error);
-      return [];
     }
   }
 

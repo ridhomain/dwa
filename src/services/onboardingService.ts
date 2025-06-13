@@ -3,22 +3,25 @@ import { FastifyInstance, FastifyBaseLogger } from 'fastify';
 
 export interface OnboardingConfig {
   id: string;
+  title: string;
   active: boolean;
   pattern: string;
   tags: string;
   origin: string;
   assignedTo: string;
-  reply?: string;
+  reply?: any;
+}
+
+export interface CampaignPayload {
+  is_campaign: boolean;
+  tags: string;
+  origin: string;
+  assigned_to: string;
 }
 
 export interface OnboardingResult {
-  isOnboarding: boolean;
-  metadata?: {
-    tags: string;
-    origin: string;
-    assignedTo: string;
-    reply?: string;
-  };
+  campaign: CampaignPayload;
+  reply: any;
 }
 
 export class OnboardingService {
@@ -39,31 +42,35 @@ export class OnboardingService {
       const onboardingConfigs = this.fastify.getConfig('ONBOARDINGS') as OnboardingConfig[];
 
       if (!onboardingConfigs || onboardingConfigs.length === 0) {
-        return { isOnboarding: false };
+        const campaign = { is_campaign: false, tags: '', origin: '', assigned_to: '' };
+        return {
+          campaign,
+          reply: null,
+        };
       }
 
       // Check each onboarding configuration
       for (const config of onboardingConfigs) {
         if (!config.active) {
-          this.logger.debug(`Onboarding config ${config.id} is not active`);
           continue;
         }
 
         try {
-          const regex = new RegExp(config.pattern, 'gi');
+          const regex = new RegExp(config.pattern, 'g');
           const matches = message.match(regex);
 
           if (matches) {
             this.logger.info(`Message matched onboarding pattern: ${config.pattern}`);
 
+            const campaign = {
+              is_campaign: true,
+              tags: config.tags || '',
+              origin: config.origin || 'onboarding',
+              assigned_to: config.assignedTo || '',
+            };
             return {
-              isOnboarding: true,
-              metadata: {
-                tags: config.tags || '',
-                origin: config.origin || 'onboarding',
-                assignedTo: config.assignedTo || '',
-                reply: config.reply,
-              },
+              campaign,
+              reply: config.reply,
             };
           }
         } catch (regexError) {
@@ -75,10 +82,18 @@ export class OnboardingService {
       }
 
       // No matching pattern found
-      return { isOnboarding: false };
+      const campaign = { is_campaign: false, tags: '', origin: '', assigned_to: '' };
+      return {
+        campaign,
+        reply: null,
+      };
     } catch (error) {
       this.logger.error('Error checking onboarding status:', error);
-      return { isOnboarding: false };
+      const campaign = { is_campaign: false, tags: '', origin: '', assigned_to: '' };
+      return {
+        campaign,
+        reply: null,
+      };
     }
   }
 }

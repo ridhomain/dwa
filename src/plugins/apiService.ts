@@ -7,5 +7,8 @@ export default fp(async (fastify) => {
     'taskApiService',
     new TaskApiService(fastify.config.TASK_API_URL, fastify.config.TOKEN, fastify.log)
   );
-  fastify.decorate('dbApiService', new DbApiService(fastify.config.DB_API_URL));
+  fastify.decorate(
+    'dbApiService',
+    new DbApiService(fastify.config.DB_API_URL, fastify.config.TOKEN)
+  );
 });

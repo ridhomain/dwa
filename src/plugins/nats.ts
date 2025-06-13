@@ -62,14 +62,10 @@ export default fp(async (fastify) => {
   let broadcastStateKV: KV;
   try {
     broadcastStateKV = await js.views.kv('broadcast_state');
-    fastify.log.info('[NATS] Connected to existing broadcast_state KV');
+    fastify.log.info('[NATS] Connected to broadcast_state KV');
   } catch (err: any) {
-    // Create KV bucket if it doesn't exist
-    broadcastStateKV = await js.views.kv('broadcast_state', {
-      history: 5,
-      ttl: 7 * 24 * 60 * 60 * 1000, // 7 days TTL in milliseconds
-    });
-    fastify.log.warn(`[NATS] ${err.message}. Create broadcast_state KV`);
+    fastify.log.error('[NATS] Failed to connect to broadcast_state KV:', err.message);
+    throw new Error('broadcast_state KV not found. Ensure WhatsApp Service is running first.');
   }
 
   // utils functions

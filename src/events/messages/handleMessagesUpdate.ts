@@ -1,9 +1,7 @@
 import { isJidStatusBroadcast, jidNormalizedUser } from 'baileys';
 import { FastifyInstance } from 'fastify';
 import { generateDaisiChatId, generateDaisiMsgId } from '../../utils';
-
-// for debounce unread chat
-const REDIS_TTL_MS = 2000;
+import { REDIS_TTL_MS } from '../../constants';
 
 export const handleMessagesUpdate = async (fastify: FastifyInstance, updates: any[]) => {
   for (const u of updates) {
