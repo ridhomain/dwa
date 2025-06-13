@@ -508,7 +508,7 @@ async function publishToDLQ(
     streamSeq: m.info.streamSequence,
   };
 
-  const dlqSubject = `v1.dlqtasks.broadcasts.${fastify.config.AGENT_ID}`;
+  const dlqSubject = `v1.dlqagent.broadcasts.${fastify.config.AGENT_ID}`;
   await fastify.publishEvent(dlqSubject, dlqMessage);
 
   fastify.log.info(`[DLQ] Message published to ${dlqSubject}`, {

@@ -4,6 +4,7 @@ import { StringCodec, AckPolicy, DeliverPolicy, ReplayPolicy } from 'nats';
 import { getSock } from '../utils/sock';
 import { sendMessage } from '../services/sendMessage';
 import { applyVariables } from '../utils/index';
+import { TaskUpdatePublisher } from '../services/taskUpdatePublisher';
 
 const sc = StringCodec();
 
@@ -26,10 +27,13 @@ export async function createMailcastConsumer(fastify: FastifyInstance) {
 
   let isShuttingDown = false;
 
+  // Initialize task publisher
+  const taskPublisher = new TaskUpdatePublisher(fastify);
+
   // Ensure consumer exists for mailcasts only
   await ensureMailcastConsumer(fastify, streamName, consumerName, mailcastSubject);
 
-  // Start the streaming consumer (mailcasts don't need fetch pattern)
+  // Start the streaming consumer
   startMailcastConsumer();
 
   // Shutdown hook
@@ -76,95 +80,88 @@ export async function createMailcastConsumer(fastify: FastifyInstance) {
       }
     }
   }
-}
 
-async function handleMailcastMessage(
-  fastify: FastifyInstance,
-  m: any,
-  data: MailcastPayload
-): Promise<void> {
-  const { agentId, taskId, phoneNumber } = data;
+  async function handleMailcastMessage(
+    fastify: FastifyInstance,
+    m: any,
+    data: MailcastPayload
+  ): Promise<void> {
+    const { agentId, taskId, phoneNumber } = data;
 
-  fastify.log.info('[Mailcast] Processing message', {
-    seq: m.seq,
-    deliveryCount: m.info.deliveryCount,
-    taskId,
-    phoneNumber,
-  });
-
-  // Validate agent ID
-  if (agentId && agentId !== fastify.config.AGENT_ID) {
-    fastify.log.warn(
-      `[Mailcast] Message for different agent: ${agentId} (expected: ${fastify.config.AGENT_ID})`
-    );
-    m.ack();
-    return;
-  }
-
-  // Check deduplication
-  const dedupKey = `dedup:${fastify.config.AGENT_ID}:mailcast:${taskId}:${phoneNumber}`;
-  const alreadyProcessed = await fastify.redis.get(dedupKey);
-
-  if (alreadyProcessed) {
-    fastify.log.info(`[Mailcast] Already processed ${phoneNumber} for task ${taskId}, skipping`);
-    m.ack();
-    return;
-  }
-
-  // Check socket
-  const sock = getSock();
-  if (!sock) {
-    fastify.log.error('[Mailcast] Socket is not initialized');
-    return; // Don't ack - let it be redelivered
-  }
-
-  // Process mailcast message
-  const result = await processMailcastMessage(fastify, sock, data);
-
-  if (result.success) {
-    // Mark as processed
-    await markAsProcessed(fastify, dedupKey, {
-      messageId: result.sentMsg?.key?.id,
+    fastify.log.info('[Mailcast] Processing message', {
       seq: m.seq,
-      messageType: 'mailcast',
+      deliveryCount: m.info.deliveryCount,
       taskId,
+      phoneNumber,
     });
 
-    // Update task status
-    if (taskId && fastify.taskApiService) {
-      await updateTaskStatus(fastify, taskId, 'COMPLETED', undefined, {
-        messageId: result.sentMsg?.key?.id,
-        sentAt: new Date().toISOString(),
-        type: 'mailcast',
-      });
+    // Validate agent ID
+    if (agentId && agentId !== fastify.config.AGENT_ID) {
+      fastify.log.warn(
+        `[Mailcast] Message for different agent: ${agentId} (expected: ${fastify.config.AGENT_ID})`
+      );
+      m.ack();
+      return;
     }
 
-    m.ack();
-    fastify.log.info('[Mailcast] Message sent successfully');
-  } else {
-    // Check retry count
-    const shouldRetry = m.info.deliveryCount < MAX_MAILCAST_RETRIES;
+    // Check deduplication
+    const dedupKey = `dedup:${fastify.config.AGENT_ID}:mailcast:${taskId}:${phoneNumber}`;
+    const alreadyProcessed = await fastify.redis.get(dedupKey);
 
-    fastify.log.error(
-      {
-        error: result.errMessage,
-        deliveryCount: m.info.deliveryCount,
-        willRetry: shouldRetry,
-        maxRetries: MAX_MAILCAST_RETRIES,
-      },
-      '[Mailcast] Failed to process message'
-    );
+    if (alreadyProcessed) {
+      fastify.log.info(`[Mailcast] Already processed ${phoneNumber} for task ${taskId}, skipping`);
+      m.ack();
+      return;
+    }
 
-    if (!shouldRetry) {
-      // Max retries reached, send to DLQ
-      try {
-        await publishToDLQ(
-          fastify,
-          m,
-          new Error(result.errMessage || 'Failed to process mailcast after max retries'),
-          'mailcast',
-          data
-        );
+    // Check socket
+    const sock = getSock();
+    if (!sock) {
+      fastify.log.error('[Mailcast] Socket is not initialized');
+      return; // Don't ack - let it be redelivered
+    }
+
+    // Process mailcast message
+    const result = await processMailcastMessage(fastify, sock, data);
+
+    if (result.success) {
+      // Mark as processed
+      await markAsProcessed(fastify, dedupKey, {
+        messageId: result.sentMsg?.key?.id,
+        seq: m.seq,
+        messageType: 'mailcast',
+        taskId,
+      });
+
+      // Update task status via NATS
+      if (taskId) {
+        await taskPublisher.markTaskCompleted(taskId, {
+          messageId: result.sentMsg?.key?.id,
+          sentAt: new Date().toISOString(),
+          type: 'mailcast',
+        });
+      }
+
+      m.ack();
+      fastify.log.info('[Mailcast] Message sent successfully');
+    } else {
+      // Check retry count
+      const shouldRetry = m.info.deliveryCount < MAX_MAILCAST_RETRIES;
+
+      fastify.log.error(
+        {
+          error: result.errMessage,
+          deliveryCount: m.info.deliveryCount,
+          willRetry: shouldRetry,
+          maxRetries: MAX_MAILCAST_RETRIES,
+        },
+        '[Mailcast] Failed to process message'
+      );
+
+      if (!shouldRetry) {
+        // Max retries reached
+        // TODO: Implement DLQ when ready
+        // await publishToDLQ(fastify, m, new Error(result.errMessage), 'mailcast', data);
 
         await markAsFailed(fastify, dedupKey, {
           error: result.errMessage,
@@ -174,78 +171,63 @@ async function handleMailcastMessage(
           taskId,
         });
 
-        if (taskId && fastify.taskApiService) {
-          await updateTaskStatus(
-            fastify,
+        if (taskId) {
+          await taskPublisher.markTaskError(
             taskId,
-            'ERROR',
             result.errMessage || 'Failed to process mailcast after 3 retries'
           );
         }
 
         m.ack();
-        fastify.log.error(`[Mailcast] Max retries reached, moved to DLQ`);
-      } catch (dlqErr: any) {
-        fastify.log.error({ err: dlqErr }, '[Mailcast] Failed to publish to DLQ');
-        // Don't ack - message will be redelivered
-      }
-    } else {
-      // Still have retries left
-      if (taskId && fastify.taskApiService) {
-        await updateTaskStatus(fastify, taskId, 'PROCESSING', undefined, {
-          retryCount: m.info.deliveryCount,
-        });
-      }
+        fastify.log.error(`[Mailcast] Max retries reached, marking as failed`);
+      } else {
+        // Still have retries left
+        if (taskId) {
+          await taskPublisher.markTaskProcessing(taskId);
+        }
 
-      // Don't ack - let NATS redeliver
-      fastify.log.info(
-        `[Mailcast] Will retry (attempt ${m.info.deliveryCount + 1}/${MAX_MAILCAST_RETRIES})`
-      );
+        // Don't ack - let NATS redeliver
+        fastify.log.info(
+          `[Mailcast] Will retry (attempt ${m.info.deliveryCount + 1}/${MAX_MAILCAST_RETRIES})`
+        );
+      }
     }
   }
-}
 
-async function handleMailcastError(fastify: FastifyInstance, m: any, error: any): Promise<void> {
-  fastify.log.error(
-    {
-      err: error,
-      messageData: m.data.toString(),
-      deliveryCount: m.info.deliveryCount,
-    },
-    '[MailcastConsumer] Error processing message'
-  );
-
-  // Permanent errors go straight to DLQ
-  const isPermanentError =
-    error instanceof SyntaxError ||
-    error.message.includes('JSON') ||
-    error.message.includes('Unexpected token');
-
-  if (isPermanentError) {
-    try {
-      await publishToDLQ(fastify, m, error, 'mailcast');
-      m.ack();
-      fastify.log.error('[MailcastConsumer] Permanent error, moved to DLQ');
-    } catch (dlqErr) {
-      fastify.log.error({ err: dlqErr }, '[MailcastConsumer] Failed to publish to DLQ');
-      // Don't ack - keep in queue
-    }
-  } else if (m.info.deliveryCount >= MAX_MAILCAST_RETRIES) {
-    // Max retries for other errors
-    try {
-      await publishToDLQ(fastify, m, error, 'mailcast');
-      m.ack();
-      fastify.log.error('[MailcastConsumer] Max retries reached, moved to DLQ');
-    } catch (dlqErr) {
-      fastify.log.error({ err: dlqErr }, '[MailcastConsumer] Failed to publish to DLQ');
-      // Don't ack - keep in queue
-    }
-  } else {
-    // Let it retry
-    fastify.log.warn(
-      `[MailcastConsumer] Temporary error, will retry (attempt ${m.info.deliveryCount + 1}/${MAX_MAILCAST_RETRIES})`
+  async function handleMailcastError(fastify: FastifyInstance, m: any, error: any): Promise<void> {
+    fastify.log.error(
+      {
+        err: error,
+        messageData: m.data.toString(),
+        deliveryCount: m.info.deliveryCount,
+      },
+      '[MailcastConsumer] Error processing message'
     );
-    // Don't ack - will be redelivered
+
+    // Permanent errors (no retry needed)
+    const isPermanentError =
+      error instanceof SyntaxError ||
+      error.message.includes('JSON') ||
+      error.message.includes('Unexpected token');
+
+    if (isPermanentError) {
+      // TODO: Implement DLQ when ready
+      // await publishToDLQ(fastify, m, error, 'mailcast');
+      m.ack();
+      fastify.log.error('[MailcastConsumer] Permanent error, acknowledging message');
+    } else if (m.info.deliveryCount >= MAX_MAILCAST_RETRIES) {
+      // Max retries for other errors
+      // TODO: Implement DLQ when ready
+      // await publishToDLQ(fastify, m, error, 'mailcast');
+      m.ack();
+      fastify.log.error('[MailcastConsumer] Max retries reached, acknowledging message');
+    } else {
+      // Let it retry
+      fastify.log.warn(
+        `[MailcastConsumer] Temporary error, will retry (attempt ${m.info.deliveryCount + 1}/${MAX_MAILCAST_RETRIES})`
+      );
+      // Don't ack - will be redelivered
+    }
   }
 }
 
@@ -315,7 +297,6 @@ async function processMailcastMessage(
   }
 }
 
-// Shared utility functions
 async function markAsProcessed(
   fastify: FastifyInstance,
   dedupKey: string,
@@ -346,42 +327,8 @@ async function markAsFailed(fastify: FastifyInstance, dedupKey: string, data: an
   );
 }
 
-async function updateTaskStatus(
-  fastify: FastifyInstance,
-  taskId: string,
-  status: 'COMPLETED' | 'PROCESSING' | 'ERROR',
-  error?: string,
-  result?: any
-): Promise<void> {
-  try {
-    const updateData: any = {
-      status,
-    };
-
-    // Only add finishedAt for terminal states (COMPLETED or ERROR)
-    if (status === 'COMPLETED' || status === 'ERROR') {
-      updateData.finishedAt = new Date().toISOString();
-    }
-
-    if (status === 'ERROR' && error) {
-      updateData.error = error;
-    }
-
-    if (status === 'COMPLETED' && result) {
-      updateData.result = result;
-    }
-
-    if (status === 'PROCESSING' && result?.retryCount) {
-      updateData.retryCount = result.retryCount;
-    }
-
-    await fastify.taskApiService.patchTask(taskId, updateData);
-    fastify.log.info(`[MailcastConsumer] Task ${taskId} marked as ${status}`);
-  } catch (err: any) {
-    fastify.log.error({ err, taskId }, `[MailcastConsumer] Failed to update task status`);
-  }
-}
-
+// TODO: Implement DLQ functionality when ready
+/*
 async function publishToDLQ(
   fastify: FastifyInstance,
   m: any,
@@ -389,28 +336,6 @@ async function publishToDLQ(
   messageType: string,
   decodedData?: any
 ): Promise<void> {
-  const dlqMessage = {
-    originalSubject: m.subject,
-    originalData: sc.decode(m.data),
-    messageType,
-    error: error.message || 'Unknown error',
-    errorStack: error.stack,
-    agentId: fastify.config.AGENT_ID,
-    companyId: fastify.config.COMPANY_ID,
-    taskId: decodedData?.taskId,
-    phoneNumber: decodedData?.phoneNumber,
-    failedAt: new Date().toISOString(),
-    deliveryCount: m.info.deliveryCount,
-    seq: m.seq,
-    streamSeq: m.info.streamSequence,
-  };
-
-  const dlqSubject = `v1.dlqtasks.mailcasts.${fastify.config.AGENT_ID}`;
-  await fastify.publishEvent(dlqSubject, dlqMessage);
-
-  fastify.log.info(`[DLQ] Message published to ${dlqSubject}`, {
-    taskId: decodedData?.taskId,
-    phoneNumber: decodedData?.phoneNumber,
-    error: error.message,
-  });
+  // DLQ implementation will go here
 }
+*/
