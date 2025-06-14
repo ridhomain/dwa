@@ -1,521 +1,462 @@
-// src/consumers/createBroadcastConsumer.ts
 import { FastifyInstance } from 'fastify';
-import { StringCodec, AckPolicy, DeliverPolicy, ReplayPolicy } from 'nats';
+import { StringCodec } from 'nats';
 import { getSock } from '../utils/sock';
 import { sendMessage } from '../services/sendMessage';
 import { applyVariables } from '../utils/index';
-import { updateBroadcastProgress, BroadcastState, autoPauseBroadcasts } from '../utils/broadcast';
+import {
+  BroadcastState,
+  updateBroadcastProgress,
+  transitionBroadcastStatus,
+} from '../utils/broadcast';
+import { TaskUpdatePublisher } from '../services/taskUpdatePublisher';
 
 const sc = StringCodec();
 
-interface BroadcastPayload {
-  companyId: string;
-  agentId: string;
-  taskId: string;
+interface BroadcastTask {
+  _id: string;
   batchId: string;
   phoneNumber: string;
   message: any;
-  options?: any;
-  variables?: any;
-  label?: string;
-  taskAgent?: 'DAISI' | 'META';
-  contact?: {
-    name?: string;
-    phone: string;
-    [key: string]: any;
-  };
+  variables?: Record<string, any>;
+  contact?: Record<string, any>;
+  status: string;
 }
 
 export async function createBroadcastConsumer(fastify: FastifyInstance) {
-  const streamName = 'agent_durable_stream';
-  const consumerName = `broadcast-consumer-${fastify.config.AGENT_ID}`;
-  const broadcastSubject = `v1.broadcasts.${fastify.config.AGENT_ID}`;
-
+  let currentProcessor: BroadcastProcessor | null = null;
+  let connectionMonitorInterval: NodeJS.Timeout;
   let isShuttingDown = false;
-  let stateWatcher: any;
 
-  // Ensure consumer exists
-  await ensureBroadcastConsumer(fastify, streamName, consumerName, broadcastSubject);
+  const taskPublisher = new TaskUpdatePublisher(fastify);
+  const broadcastKV = fastify.broadcastStateKV;
 
-  // Check socket status before starting
-  const sock = getSock();
-  if (!sock || sock.user === undefined) {
-    fastify.log.warn('[BroadcastConsumer] Socket not ready, waiting for connection');
+  fastify.log.info('[BroadcastConsumer] Initializing broadcast consumer');
 
-    const checkInterval = setInterval(() => {
-      const currentSock = getSock();
-      if (currentSock && currentSock.user) {
-        clearInterval(checkInterval);
-        fastify.log.info('[BroadcastConsumer] Socket connected, starting worker');
-        startBroadcastWorker();
-      }
-    }, 10000);
+  // Start connection monitor
+  startConnectionMonitor();
 
-    fastify.addHook('onClose', () => clearInterval(checkInterval));
-  } else {
-    fastify.log.info('[BroadcastConsumer] Socket ready, starting worker');
-    startBroadcastWorker();
-  }
-
-  // Shutdown hook
-  fastify.addHook('onClose', async () => {
-    fastify.log.info('[BroadcastConsumer] Initiating shutdown...');
-    isShuttingDown = true;
-
-    if (stateWatcher) {
-      await stateWatcher.destroy();
-    }
+  // Watch for broadcast state changes for this agent
+  const stateWatcher = await broadcastKV.watch({
+    key: `${fastify.config.AGENT_ID}.*`,
   });
 
-  async function startBroadcastWorker() {
+  // Process state changes
+  (async () => {
     try {
-      const consumer = await fastify.js.consumers.get(streamName, consumerName);
+      for await (const entry of stateWatcher) {
+        if (isShuttingDown) break;
 
-      // Local cache of broadcast states
-      const broadcastStates = new Map<string, BroadcastState>();
-
-      // Setup KV watcher for real-time state updates
-      stateWatcher = await fastify.broadcastStateKV.watch({
-        key: `${fastify.config.AGENT_ID}.*`, // Changed from _ to .
-      });
-
-      // Background process: Watch for state changes
-      (async () => {
-        try {
-          for await (const entry of stateWatcher) {
-            // fastify.log.info(`[KV Watcher] Broadcast KVE => %o`, entry.operation);
-            // fastify.log.info(`[KV Watcher] Broadcast KVE => %o`, entry.key);
-
-            if (isShuttingDown) break;
-
-            const kValue = sc.decode(entry.value);
-            const kOperation = entry.operation;
-
-            if (kOperation === 'PUT') {
-              fastify.log.info(`[KV Watcher] Broadcast KVE => %o`, sc.decode(entry.value));
-              try {
-                const state: BroadcastState = JSON.parse(kValue);
-                broadcastStates.set(state.batchId, state);
-
-                fastify.log.debug(
-                  `[KV Watcher] Broadcast ${state.batchId} => ${state.status} (key: ${entry.key})`
-                );
-              } catch (parseErr) {
-                fastify.log.error(
-                  { err: parseErr, data: kValue },
-                  '[KV Watcher] Failed to parse state'
-                );
-              }
-            } else if (kOperation === 'DELETE') {
-              const parts = entry.key.split('.');
-              if (parts.length > 1) {
-                const batchId = parts[1];
-                broadcastStates.delete(batchId);
-                fastify.log.debug(`[KV Watcher] Broadcast ${batchId} deleted`);
-              }
-            }
-          }
-        } catch (err: any) {
-          if (!isShuttingDown) {
-            fastify.log.error({ err }, '[KV Watcher] Error in state watcher');
-          }
-        }
-      })();
-
-      // Initial load of active broadcasts
-      await loadActiveBroadcasts(broadcastStates);
-
-      fastify.log.info(
-        `[BroadcastConsumer] Started with ${broadcastStates.size} active broadcasts`
-      );
-
-      // Main processing loop
-      while (!isShuttingDown) {
-        try {
-          // Check socket status
-          const currentSock = getSock();
-          fastify.log.info('sock => %s', currentSock);
-          if (!currentSock || !currentSock.user) {
-            fastify.log.warn('[BroadcastConsumer] Socket lost, auto-pausing broadcasts');
-
-            const pausedCount = await autoPauseBroadcasts(
-              fastify.broadcastStateKV,
-              fastify.config.AGENT_ID,
-              'AUTO_PAUSE_DISCONNECTION'
-            );
-
-            if (pausedCount > 0) {
-              fastify.log.info(`[BroadcastConsumer] Auto-paused ${pausedCount} broadcasts`);
-            }
-
-            await sleep(10000);
-            continue;
-          }
-
-          // Fetch messages
-          const batch = await consumer.fetch();
-          fastify.log.info('batch %o', batch);
-
-          for await (const m of batch) {
-            if (isShuttingDown) break;
-            fastify.log.info('m %o', batch);
-
-            try {
-              const data: BroadcastPayload = JSON.parse(sc.decode(m.data));
-              const state = broadcastStates.get(data.batchId);
-              fastify.log.info(`[BroadcastConsumer] Broadcast state: %o`, state);
-
-              if (!state) {
-                // Not tracking this broadcast - could be deleted or not ours
-                fastify.log.debug(
-                  `[BroadcastConsumer] Unknown broadcast ${data.batchId}, acking message`
-                );
-                m.ack();
-                continue;
-              }
-
-              // Process based on status
-              switch (state.status) {
-                case 'SCHEDULED':
-                  // Not ready yet - leave in queue
-                  fastify.log.debug(
-                    `[BroadcastConsumer] Broadcast ${data.batchId} not ready (${state.status})`
-                  );
-                  continue;
-
-                case 'PROCESSING':
-                  // Good to go - process the message
-                  await handleBroadcastMessage(fastify, m, data, state);
-                  break;
-
-                case 'PAUSED':
-                  // Leave in queue for later
-                  fastify.log.debug(`[BroadcastConsumer] Broadcast ${data.batchId} is paused`);
-                  continue;
-
-                case 'CANCELLED':
-                case 'COMPLETED':
-                case 'FAILED':
-                  // Terminal states - remove from queue
-                  fastify.log.info(
-                    `[BroadcastConsumer] Removing message for ${state.status} broadcast ${data.batchId}`
-                  );
-                  m.ack();
-                  continue;
-              }
-            } catch (err: any) {
-              await handleBroadcastError(fastify, m, err);
-            }
-          }
-        } catch (err: any) {
-          if (!isShuttingDown) {
-            fastify.log.error({ err }, '[BroadcastConsumer] Worker error');
-            await sleep(5000);
-          }
-        }
-      }
-
-      fastify.log.info('[BroadcastConsumer] Worker stopped');
-    } catch (err: any) {
-      fastify.log.error({ err }, '[BroadcastConsumer] Failed to start worker');
-
-      // Restart worker if not shutting down
-      if (!isShuttingDown) {
-        fastify.log.info('[BroadcastConsumer] Will restart worker in 10 seconds...');
-        setTimeout(() => {
-          if (!isShuttingDown) {
-            startBroadcastWorker().catch((err) => {
-              fastify.log.error({ err }, '[BroadcastConsumer] Failed to restart worker');
-            });
-          }
-        }, 10000);
-      }
-    }
-  }
-
-  async function loadActiveBroadcasts(broadcastStates: Map<string, BroadcastState>): Promise<void> {
-    broadcastStates.clear();
-
-    const keys = await fastify.broadcastStateKV.keys();
-
-    for await (const key of keys) {
-      if (key.startsWith(`${fastify.config.AGENT_ID}.`)) {
-        // Changed from _ to .
-        const entry = await fastify.broadcastStateKV.get(key);
-        if (entry?.value) {
+        if (entry.operation === 'PUT' && entry.value) {
           const state: BroadcastState = JSON.parse(sc.decode(entry.value));
 
-          // Load all non-terminal broadcasts
-          if (!['COMPLETED', 'CANCELLED', 'FAILED'].includes(state.status)) {
-            broadcastStates.set(state.batchId, state);
+          fastify.log.info(
+            { batchId: state.batchId, status: state.status },
+            '[BroadcastConsumer] State change detected'
+          );
+
+          // Only process PROCESSING status
+          if (state.status === 'PROCESSING') {
+            // Check if we need to start a new processor
+            if (!currentProcessor) {
+              fastify.log.info(
+                { batchId: state.batchId },
+                '[BroadcastConsumer] Starting new processor'
+              );
+              currentProcessor = new BroadcastProcessor(state, fastify, taskPublisher);
+              currentProcessor.start().catch((err) => {
+                fastify.log.error({ err }, '[BroadcastConsumer] Processor error');
+                currentProcessor = null;
+              });
+            } else if (currentProcessor.batchId !== state.batchId) {
+              // Different batch - stop old, start new
+              fastify.log.info(
+                { oldBatchId: currentProcessor.batchId, newBatchId: state.batchId },
+                '[BroadcastConsumer] Switching to new broadcast'
+              );
+              await currentProcessor.stop();
+              currentProcessor = new BroadcastProcessor(state, fastify, taskPublisher);
+              currentProcessor.start().catch((err) => {
+                fastify.log.error({ err }, '[BroadcastConsumer] Processor error');
+                currentProcessor = null;
+              });
+            }
+            // If same batch and already processing, do nothing
+          } else {
+            // For any non-PROCESSING state, stop the processor if it exists
+            if (currentProcessor) {
+              fastify.log.info(
+                { batchId: currentProcessor.batchId, newStatus: state.status },
+                '[BroadcastConsumer] Stopping processor due to non-PROCESSING state'
+              );
+              await currentProcessor.stop();
+              currentProcessor = null;
+            }
           }
         }
       }
+    } catch (err) {
+      if (!isShuttingDown) {
+        fastify.log.error({ err }, '[BroadcastConsumer] State watcher error');
+      }
     }
+  })();
+
+  // Cleanup on shutdown
+  fastify.addHook('onClose', async () => {
+    isShuttingDown = true;
+
+    if (connectionMonitorInterval) {
+      clearInterval(connectionMonitorInterval);
+    }
+
+    if (currentProcessor) {
+      await currentProcessor.stop();
+    }
+
+    if (stateWatcher) {
+      stateWatcher.stop();
+    }
+
+    fastify.log.info('[BroadcastConsumer] Shutdown complete');
+  });
+
+  // Connection monitor
+  function startConnectionMonitor() {
+    let lastConnectionState = true;
+
+    connectionMonitorInterval = setInterval(async () => {
+      if (isShuttingDown) return;
+
+      const sock = getSock();
+      const isConnected = !!sock?.user;
+
+      // Detect disconnection
+      if (lastConnectionState && !isConnected) {
+        fastify.log.warn('[BroadcastConsumer] Connection lost, checking for active broadcasts');
+
+        // Auto-pause any active broadcast
+        const keys = await broadcastKV.keys();
+
+        for await (const key of keys) {
+          if (key.startsWith(`${fastify.config.AGENT_ID}.`)) {
+            const entry = await broadcastKV.get(key);
+            if (entry?.value) {
+              const state: BroadcastState = JSON.parse(sc.decode(entry.value));
+
+              if (state.status === 'PROCESSING') {
+                const result = await transitionBroadcastStatus(
+                  broadcastKV,
+                  fastify.config.AGENT_ID,
+                  state.batchId,
+                  'PAUSED',
+                  {
+                    pauseReason: 'AUTO_PAUSE_DISCONNECTION',
+                  }
+                );
+
+                if (result.success) {
+                  fastify.log.info(
+                    { batchId: state.batchId },
+                    '[BroadcastConsumer] Auto-paused broadcast due to disconnection'
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+
+      lastConnectionState = isConnected;
+    }, 5000); // Check every 5 seconds
   }
 }
 
-async function handleBroadcastMessage(
-  fastify: FastifyInstance,
-  m: any,
-  data: BroadcastPayload,
-  state: BroadcastState
-): Promise<void> {
-  const { batchId, taskId, phoneNumber } = data;
+// Broadcast Processor Class
+class BroadcastProcessor {
+  private isRunning = false;
+  public readonly batchId: string;
 
-  fastify.log.info('[Broadcast] Processing message', {
-    seq: m.seq,
-    deliveryCount: m.info.deliveryCount,
-    taskId,
-    batchId,
-    phoneNumber,
-    status: state.status,
-  });
-
-  // Check deduplication
-  const dedupKey = `dedup:${fastify.config.AGENT_ID}:${taskId}:${phoneNumber}`;
-  const alreadyProcessed = await fastify.redis.get(dedupKey);
-
-  if (alreadyProcessed) {
-    fastify.log.info(`[Broadcast] Already processed ${phoneNumber}, skipping`);
-    m.ack();
-    return;
+  constructor(
+    private state: BroadcastState,
+    private fastify: FastifyInstance,
+    private taskPublisher: TaskUpdatePublisher
+  ) {
+    this.batchId = state.batchId;
   }
 
-  // Apply rate limiting if configured
-  if (state.rateLimit?.messagesPerSecond) {
-    const delayMs = Math.floor(1000 / state.rateLimit.messagesPerSecond);
-    await sleep(delayMs);
-  } else {
-    // Default delay for broadcasts (3-5 seconds)
-    const delayMs = Math.floor(Math.random() * 2000) + 3000;
-    await sleep(delayMs);
-  }
+  async start() {
+    this.isRunning = true;
 
-  // Process message
-  const result = await processBroadcastMessage(fastify, data);
+    this.fastify.log.info(
+      {
+        batchId: this.batchId,
+        total: this.state.total,
+        completed: this.state.completed,
+        failed: this.state.failed,
+      },
+      '[BroadcastProcessor] Starting broadcast processing'
+    );
 
-  if (result.success) {
-    // Mark as processed
-    await markAsProcessed(fastify, dedupKey, {
-      messageId: result.sentMsg?.key?.id,
-      seq: m.seq,
-      messageType: 'broadcast',
-    });
+    // Small delay to ensure everything is ready
+    await sleep(1000);
 
-    // Update broadcast progress
-    await updateBroadcastProgress(fastify.broadcastStateKV, batchId, fastify.config.AGENT_ID, {
-      status: 'COMPLETED',
-      phoneNumber,
-    });
+    while (this.isRunning) {
+      try {
+        // 1. Check connection
+        const sock = getSock();
+        if (!sock?.user) {
+          this.fastify.log.warn('[BroadcastProcessor] No socket connection');
+          await this.pauseBroadcast('AUTO_PAUSE_DISCONNECTION');
+          break;
+        }
 
-    // Update task status
-    if (taskId && fastify.taskApiService) {
-      await updateTaskStatus(fastify, taskId, 'COMPLETED');
+        // 2. Get next pending task
+        const task = await this.getNextPendingTask();
+
+        if (!task) {
+          this.fastify.log.info('[BroadcastProcessor] No more pending tasks');
+
+          // Check the current state to see final counts
+          const stateKey = `${this.fastify.config.AGENT_ID}.${this.batchId}`;
+          const stateEntry = await this.fastify.broadcastStateKV.get(stateKey);
+
+          if (stateEntry?.value) {
+            const currentState: BroadcastState = JSON.parse(sc.decode(stateEntry.value));
+            this.fastify.log.info(
+              {
+                batchId: this.batchId,
+                total: currentState.total,
+                processed: currentState.processed,
+                completed: currentState.completed,
+                failed: currentState.failed,
+                status: currentState.status,
+              },
+              '[BroadcastProcessor] Final broadcast state'
+            );
+          }
+
+          // All tasks processed - state will auto-update based on progress
+          break;
+        }
+
+        this.fastify.log.info(
+          {
+            taskId: task._id,
+            phoneNumber: task.phoneNumber,
+            status: task.status,
+          },
+          '[BroadcastProcessor] Got task, starting to process'
+        );
+
+        // 3. Process the task
+        const shouldContinue = await this.processTask(task);
+
+        if (!shouldContinue) {
+          break;
+        }
+
+        // 4. Apply delay (2-5 seconds)
+        const delay = 2000 + Math.floor(Math.random() * 3000);
+        this.fastify.log.debug(`[BroadcastProcessor] Waiting ${delay}ms before next message`);
+        await sleep(delay);
+      } catch (err: any) {
+        this.fastify.log.error({ err }, '[BroadcastProcessor] Unexpected error in main loop');
+        await this.pauseBroadcast('ERROR', err.message);
+        break;
+      }
     }
 
-    m.ack();
-    fastify.log.info(`[Broadcast] Message sent successfully to ${phoneNumber}`);
-  } else {
-    // Send to DLQ on failure
+    this.isRunning = false;
+    this.fastify.log.info('[BroadcastProcessor] Stopped processing');
+  }
+
+  async stop() {
+    this.fastify.log.info('[BroadcastProcessor] Stopping processor');
+    this.isRunning = false;
+  }
+
+  private async getNextPendingTask(): Promise<BroadcastTask | null> {
     try {
-      await publishToDLQ(
-        fastify,
-        m,
-        new Error(result.errMessage || 'Failed to send broadcast'),
-        'broadcast',
-        data
+      this.fastify.log.debug(
+        {
+          batchId: this.batchId,
+          taskApiUrl: this.fastify.config.TASK_API_URL,
+        },
+        '[BroadcastProcessor] Fetching next pending task'
       );
 
-      await updateBroadcastProgress(fastify.broadcastStateKV, batchId, fastify.config.AGENT_ID, {
-        status: 'ERROR',
-        phoneNumber,
-      });
+      const task = await this.fastify.taskApiService.getNextPendingTask(this.batchId);
 
-      if (taskId && fastify.taskApiService) {
-        await updateTaskStatus(
-          fastify,
-          taskId,
-          'ERROR',
-          result.errMessage || 'Failed to send broadcast'
+      if (task) {
+        this.fastify.log.debug(
+          { taskId: task._id, status: task.status, phoneNumber: task.phoneNumber },
+          '[BroadcastProcessor] Found task'
+        );
+      } else {
+        this.fastify.log.debug(
+          { batchId: this.batchId },
+          '[BroadcastProcessor] No task returned from API'
         );
       }
 
-      m.ack();
-    } catch (dlqErr: any) {
-      fastify.log.error({ err: dlqErr }, '[Broadcast] Failed to publish to DLQ');
-      // Don't ack - message stays in queue
-    }
-  }
-}
-
-async function handleBroadcastError(fastify: FastifyInstance, m: any, error: any): Promise<void> {
-  fastify.log.error(
-    {
-      err: error,
-      messageData: m.data.toString(),
-      deliveryCount: m.info.deliveryCount,
-    },
-    '[BroadcastConsumer] Error processing message'
-  );
-
-  // All errors go to DLQ for broadcasts (no retries)
-  try {
-    await publishToDLQ(fastify, m, error, 'broadcast');
-    m.ack();
-    fastify.log.error('[BroadcastConsumer] Error moved to DLQ');
-  } catch (dlqErr) {
-    fastify.log.error({ err: dlqErr }, '[BroadcastConsumer] Failed to publish to DLQ');
-    // Don't ack - keep in queue
-  }
-}
-
-// Helper functions
-async function ensureBroadcastConsumer(
-  fastify: FastifyInstance,
-  streamName: string,
-  consumerName: string,
-  subject: string
-): Promise<void> {
-  try {
-    await fastify.jsm.consumers.info(streamName, consumerName);
-    fastify.log.info(`[NATS] Broadcast consumer "${consumerName}" already exists`);
-  } catch (err: any) {
-    if (err.message.includes('consumer not found')) {
-      await fastify.jsm.consumers.add(streamName, {
-        durable_name: consumerName,
-        filter_subject: subject,
-        ack_policy: AckPolicy.Explicit,
-        deliver_policy: DeliverPolicy.All,
-        max_deliver: 1, // No redelivery for broadcasts
-        ack_wait: 60 * 1_000_000_000, // 60 seconds
-        replay_policy: ReplayPolicy.Instant,
-      });
-      fastify.log.info(`[NATS] Broadcast consumer "${consumerName}" created`);
-    } else {
+      return task;
+    } catch (err: any) {
+      // If 404, no pending tasks
+      if (err.statusCode === 404) {
+        this.fastify.log.debug(
+          { batchId: this.batchId },
+          '[BroadcastProcessor] API returned 404 - no pending tasks'
+        );
+        return null;
+      }
+      this.fastify.log.error(
+        { err, batchId: this.batchId },
+        '[BroadcastProcessor] Failed to get next task'
+      );
       throw err;
     }
   }
-}
 
-async function processBroadcastMessage(
-  fastify: FastifyInstance,
-  data: BroadcastPayload
-): Promise<{ success: boolean; errMessage?: string; sentMsg?: any }> {
-  try {
-    const { phoneNumber, message, options, variables, contact, batchId } = data;
+  private async processTask(task: BroadcastTask): Promise<boolean> {
+    const { _id: taskId, phoneNumber, message, variables, contact } = task;
 
-    if (!phoneNumber || !message) {
-      throw new Error('Missing required fields: phoneNumber or message');
+    this.fastify.log.info({ taskId, phoneNumber }, '[BroadcastProcessor] Processing task');
+
+    try {
+      // Get socket
+      const sock = getSock();
+      if (!sock) {
+        throw new Error('Socket not available');
+      }
+
+      // Prepare JID
+      const jid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`;
+
+      // Apply variables if any
+      let processedMessage = message;
+      if (variables || contact) {
+        processedMessage = applyVariables(message, {
+          ...contact,
+          ...variables,
+        });
+      }
+
+      // Send message
+      const result = await sendMessage(sock, processedMessage, jid, null);
+
+      if (result.success && result.sentMsg) {
+        // Success
+        const messageId = result.sentMsg.key.id;
+
+        // Update broadcast progress
+        await updateBroadcastProgress(
+          this.fastify.broadcastStateKV,
+          this.batchId,
+          this.fastify.config.AGENT_ID,
+          { status: 'COMPLETED', phoneNumber }
+        );
+
+        // Publish task update via NATS
+        await this.taskPublisher.markTaskCompleted(taskId, {
+          messageId,
+          sentAt: new Date().toISOString(),
+          type: 'broadcast',
+        });
+
+        this.fastify.log.info(
+          { taskId, messageId },
+          '[BroadcastProcessor] Task completed successfully'
+        );
+      } else {
+        // Failed - but we continue with next task
+        const error = result.errMessage || 'Failed to send message';
+
+        // Update broadcast progress as ERROR
+        await updateBroadcastProgress(
+          this.fastify.broadcastStateKV,
+          this.batchId,
+          this.fastify.config.AGENT_ID,
+          { status: 'ERROR', phoneNumber }
+        );
+
+        // Mark task as ERROR
+        await this.taskPublisher.markTaskError(taskId, error);
+
+        this.fastify.log.error(
+          { taskId, error },
+          '[BroadcastProcessor] Task failed, continuing with next'
+        );
+
+        // Check failure rate
+        const stateKey = `${this.fastify.config.AGENT_ID}.${this.batchId}`;
+        const stateEntry = await this.fastify.broadcastStateKV.get(stateKey);
+
+        if (stateEntry?.value) {
+          const currentState: BroadcastState = JSON.parse(sc.decode(stateEntry.value));
+          const failureRate =
+            currentState.processed > 0 ? currentState.failed / currentState.processed : 0;
+
+          // If failure rate > 50%, pause the broadcast
+          if (failureRate > 0.5 && currentState.processed >= 5) {
+            this.fastify.log.warn(
+              { failureRate, failed: currentState.failed, processed: currentState.processed },
+              '[BroadcastProcessor] High failure rate detected, pausing broadcast'
+            );
+            await this.pauseBroadcast(
+              'ERROR',
+              `High failure rate: ${(failureRate * 100).toFixed(1)}%`
+            );
+            return false; // Stop processing
+          }
+        }
+      }
+
+      return true; // Continue with next task
+    } catch (err: any) {
+      this.fastify.log.error(
+        { err, taskId },
+        '[BroadcastProcessor] Unexpected error processing task'
+      );
+
+      // Mark as ERROR and continue
+      await this.taskPublisher.markTaskError(taskId, err.message);
+
+      // Update progress
+      await updateBroadcastProgress(
+        this.fastify.broadcastStateKV,
+        this.batchId,
+        this.fastify.config.AGENT_ID,
+        { status: 'ERROR', phoneNumber }
+      );
+
+      // Continue with next task (don't pause entire broadcast for one error)
+      return true;
     }
+  }
 
-    const sock = getSock();
-    if (!sock) {
-      throw new Error('Socket is not initialized');
+  private async pauseBroadcast(reason: string, error?: string) {
+    this.fastify.log.info(
+      { batchId: this.batchId, reason, error },
+      '[BroadcastProcessor] Pausing broadcast'
+    );
+
+    try {
+      await transitionBroadcastStatus(
+        this.fastify.broadcastStateKV,
+        this.fastify.config.AGENT_ID,
+        this.batchId,
+        'PAUSED',
+        {
+          pauseReason: reason as any,
+          lastError: error,
+          pausedAt: new Date().toISOString(),
+        }
+      );
+    } catch (err: any) {
+      this.fastify.log.error({ err }, '[BroadcastProcessor] Failed to pause broadcast');
     }
-
-    const jid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`;
-
-    // Apply template variables
-    let processedMessage = message;
-    if ((variables && Object.keys(variables).length > 0) || contact) {
-      const allVariables = {
-        ...contact,
-        ...variables,
-      };
-      processedMessage = applyVariables(message, allVariables);
-    }
-
-    fastify.log.info(`[Broadcast] Sending to ${phoneNumber} (batch: ${batchId})`);
-
-    const { quoted } = options ?? {};
-    const result = await sendMessage(sock, processedMessage, jid, quoted);
-
-    if (!result.success) {
-      fastify.log.error(`[Broadcast] Failed to send to ${phoneNumber}: ${result.errMessage}`);
-    }
-
-    return result;
-  } catch (err: any) {
-    return {
-      success: false,
-      errMessage: err.message,
-    };
   }
 }
 
-async function markAsProcessed(
-  fastify: FastifyInstance,
-  dedupKey: string,
-  data: any
-): Promise<void> {
-  await fastify.redis.set(
-    dedupKey,
-    JSON.stringify({
-      processedAt: new Date().toISOString(),
-      ...data,
-    }),
-    'EX',
-    604800, // 7 days TTL
-    'NX'
-  );
-}
-
-async function updateTaskStatus(
-  fastify: FastifyInstance,
-  taskId: string,
-  status: 'COMPLETED' | 'ERROR',
-  error?: string
-): Promise<void> {
-  try {
-    const updateData: any = {
-      status,
-      finishedAt: new Date(),
-    };
-
-    if (status === 'ERROR' && error) {
-      updateData.errorReason = error;
-    }
-
-    await fastify.taskApiService.patchTask(taskId, updateData);
-    fastify.log.info(`[BroadcastConsumer] Task ${taskId} marked as ${status}`);
-  } catch (err: any) {
-    fastify.log.error({ err, taskId }, `[BroadcastConsumer] Failed to update task status`);
-  }
-}
-
-async function publishToDLQ(
-  fastify: FastifyInstance,
-  m: any,
-  error: any,
-  messageType: string,
-  decodedData?: any
-): Promise<void> {
-  const dlqMessage = {
-    originalSubject: m.subject,
-    originalData: sc.decode(m.data),
-    messageType,
-    error: error.message || 'Unknown error',
-    errorStack: error.stack,
-    agentId: fastify.config.AGENT_ID,
-    companyId: fastify.config.COMPANY_ID,
-    taskId: decodedData?.taskId,
-    phoneNumber: decodedData?.phoneNumber,
-    batchId: decodedData?.batchId,
-    failedAt: new Date().toISOString(),
-    deliveryCount: m.info.deliveryCount,
-    seq: m.seq,
-    streamSeq: m.info.streamSequence,
-  };
-
-  const dlqSubject = `v1.dlqagent.broadcasts.${fastify.config.AGENT_ID}`;
-  await fastify.publishEvent(dlqSubject, dlqMessage);
-
-  fastify.log.info(`[DLQ] Message published to ${dlqSubject}`, {
-    taskId: decodedData?.taskId,
-    phoneNumber: decodedData?.phoneNumber,
-    error: error.message,
-  });
-}
-
+// Helper function
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));

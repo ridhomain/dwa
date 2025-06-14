@@ -16,7 +16,7 @@ import healthRoutes from './routes/health';
 async function start() {
   const fastify = Fastify({
     logger: {
-      level: 'info',
+      level: 'debug',
       transport: {
         target: 'pino-pretty',
         options: {
